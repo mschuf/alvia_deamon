@@ -17,7 +17,7 @@ async function bootstrap() {
   const swaggerConfig = new DocumentBuilder()
     .setTitle('ALVIA Daemon API')
     .setDescription(
-      'Daemon de OCR para procesar documentos pendientes, consultar Gemini y actualizar lk_documentos.',
+      'Daemon de OCR para procesar documentos pendientes, delegar OCR en alvia_ocr y actualizar lk_documentos.',
     )
     .setVersion('1.0.0')
     .addTag('daemon')

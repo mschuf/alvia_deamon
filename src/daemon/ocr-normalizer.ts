@@ -1,225 +1,178 @@
-import { NormalizedOcrData } from './daemon.types';
+import { PreparedOcrPayload } from './daemon.types';
 
-const DEFAULT_RUC = '0000000-0';
-const DEFAULT_PROVIDER_NAME = 'PROVEEDOR SIN NOMBRE';
+const LEGACY_KEY_ALIASES: Record<string, string> = {
+  sn_ruc: 'sn_id_fiscal',
+  ruc: 'sn_id_fiscal',
+  ruc_proveedor: 'sn_id_fiscal',
+  numero_documento: 'doc_numero',
+  numero_factura: 'doc_numero',
+  fecha_emision: 'doc_fecha_emision',
+  timbrado: 'doc_timbrado',
+  vence_timbrado: 'doc_vence_timbrado',
+  periodo: 'doc_periodo',
+  cdc: 'doc_cdc',
+  monto_10: 'doc_monto_10',
+  iva_10: 'doc_iva_10',
+  monto_5: 'doc_monto_5',
+  iva_5: 'doc_iva_5',
+  monto_exento: 'doc_monto_exento',
+  monto_total: 'doc_monto_total',
+};
+
+const PROVIDER_NAME_KEYS = [
+  'sn_name',
+  'sn_nombre',
+  'proveedor',
+  'nombre_proveedor',
+];
+
+const PROVIDER_FISCAL_ID_KEYS = [
+  'sn_id_fiscal',
+  'sn_ruc',
+  'ruc',
+  'ruc_proveedor',
+];
 
 export function normalizeOcrPayload(
-  payload: Record<string, unknown>,
-): NormalizedOcrData {
-  const docFechaEmision = normalizeDate(
-    firstValue(payload, ['doc_fecha_emision', 'fecha_emision']),
-  );
-  const docPeriodo =
-    normalizePeriod(firstValue(payload, ['doc_periodo', 'periodo'])) ??
-    derivePeriodFromDate(docFechaEmision);
+  rawPayload: Record<string, unknown>,
+  updatableColumns: Set<string>,
+): PreparedOcrPayload {
+  const payload = unwrapPayload(rawPayload);
+  const documentUpdates: Record<string, unknown> = {};
+  const ignoredFields: string[] = [];
+  const aliasesApplied: Record<string, string> = {};
 
-  const normalized: NormalizedOcrData = {
-    sn_ruc: normalizeRuc(
-      firstString(payload, ['sn_ruc', 'ruc', 'ruc_proveedor']),
-    ),
-    sn_nombre:
-      firstString(payload, [
-        'sn_name',
-        'sn_nombre',
-        'proveedor',
-        'nombre_proveedor',
-      ]) ?? DEFAULT_PROVIDER_NAME,
-    doc_numero:
-      firstString(payload, [
-        'doc_numero',
-        'numero_documento',
-        'numero_factura',
-      ]) ?? null,
-    doc_fecha_emision: docFechaEmision,
-    doc_timbrado: normalizeTimbrado(
-      firstValue(payload, ['doc_timbrado', 'timbrado']),
-    ),
-    doc_vence_timbrado: normalizeDate(
-      firstValue(payload, ['doc_vence_timbrado', 'vence_timbrado']),
-    ),
-    doc_periodo: docPeriodo,
-    doc_cdc: firstString(payload, ['doc_cdc', 'cdc']) ?? '',
-    doc_monto_10: normalizeNumber(
-      firstValue(payload, ['doc_monto_10', 'monto_10']),
-    ),
-    doc_iva_10: normalizeNumber(firstValue(payload, ['doc_iva_10', 'iva_10'])),
-    doc_monto_5: normalizeNumber(
-      firstValue(payload, ['doc_monto_5', 'monto_5']),
-    ),
-    doc_iva_5: normalizeNumber(firstValue(payload, ['doc_iva_5', 'iva_5'])),
-    doc_monto_exento: normalizeNumber(
-      firstValue(payload, ['doc_monto_exento', 'monto_exento']),
-    ),
-    doc_monto_total: normalizeNumber(
-      firstValue(payload, ['doc_monto_total', 'monto_total']),
-    ),
-  };
+  for (const [rawKey, value] of Object.entries(payload)) {
+    const key = rawKey.trim();
+    if (!key) {
+      continue;
+    }
 
-  return normalized;
-}
+    if (value === undefined) {
+      continue;
+    }
 
-function firstValue(payload: Record<string, unknown>, keys: string[]): unknown {
-  for (const key of keys) {
-    if (key in payload && payload[key] != null) {
-      return payload[key];
+    const resolvedColumn = resolveDocumentColumnKey(key, updatableColumns);
+    if (!resolvedColumn) {
+      ignoredFields.push(key);
+      continue;
+    }
+
+    // No pisar el valor real si ya vino con el nombre canonico.
+    if (
+      key !== resolvedColumn &&
+      Object.prototype.hasOwnProperty.call(documentUpdates, resolvedColumn)
+    ) {
+      continue;
+    }
+
+    documentUpdates[resolvedColumn] = value;
+
+    if (key !== resolvedColumn) {
+      aliasesApplied[key] = resolvedColumn;
     }
   }
 
-  return undefined;
+  const providerFiscalId =
+    toNonEmptyString(documentUpdates.sn_id_fiscal) ??
+    firstNonEmptyFromPayload(payload, PROVIDER_FISCAL_ID_KEYS);
+
+  const providerName = firstNonEmptyFromPayload(payload, PROVIDER_NAME_KEYS);
+
+  return {
+    documentUpdates,
+    providerFiscalId,
+    providerName,
+    ignoredFields,
+    aliasesApplied,
+  };
 }
 
-function firstString(
+function unwrapPayload(
+  rawPayload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!rawPayload || typeof rawPayload !== 'object') {
+    return {};
+  }
+
+  const direct = asRecord(rawPayload);
+  if (!direct || Object.keys(direct).length === 0) {
+    return {};
+  }
+
+  const nestedData = tryParseNestedRecord(direct.data);
+  if (nestedData) {
+    return nestedData;
+  }
+
+  const nestedResult = tryParseNestedRecord(direct.result);
+  if (nestedResult) {
+    return nestedResult;
+  }
+
+  return direct;
+}
+
+function tryParseNestedRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      return asRecord(parsed);
+    } catch {
+      return null;
+    }
+  }
+
+  return asRecord(value);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function resolveDocumentColumnKey(
+  key: string,
+  updatableColumns: Set<string>,
+): string | null {
+  if (updatableColumns.has(key)) {
+    return key;
+  }
+
+  const legacyAlias = LEGACY_KEY_ALIASES[key];
+  if (legacyAlias && updatableColumns.has(legacyAlias)) {
+    return legacyAlias;
+  }
+
+  return null;
+}
+
+function firstNonEmptyFromPayload(
   payload: Record<string, unknown>,
   keys: string[],
 ): string | null {
-  const value = firstValue(payload, keys);
-  if (typeof value !== 'string') {
-    return null;
+  for (const key of keys) {
+    const value = toNonEmptyString(payload[key]);
+    if (value) {
+      return value;
+    }
   }
 
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  return null;
 }
 
-function normalizeRuc(value: string | null): string {
-  if (!value) {
-    return DEFAULT_RUC;
-  }
-
-  const digits = value.replace(/\D/g, '');
-  if (digits.length < 2) {
-    return DEFAULT_RUC;
-  }
-
-  const body = digits.slice(0, -1).slice(-7).padStart(7, '0');
-  const verifier = digits.slice(-1);
-
-  return `${body}-${verifier}`;
-}
-
-function normalizeDate(value: unknown): string | null {
-  if (!value) {
-    return null;
-  }
-
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return value.toISOString().slice(0, 10);
-  }
-
+function toNonEmptyString(value: unknown): string | null {
   if (typeof value === 'string') {
     const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-      return trimmed;
-    }
-
-    const slashDateMatch = trimmed.match(/^(\d{2})[/-](\d{2})[/-](\d{4})$/);
-    if (slashDateMatch) {
-      const [, day, month, year] = slashDateMatch;
-      return `${year}-${month}-${day}`;
-    }
-
-    const asDate = new Date(trimmed);
-    if (!Number.isNaN(asDate.getTime())) {
-      return asDate.toISOString().slice(0, 10);
-    }
-  }
-
-  return null;
-}
-
-function normalizePeriod(value: unknown): string | null {
-  if (value == null) {
-    return null;
-  }
-
-  const primitiveValue = toPrimitiveString(value);
-  if (!primitiveValue) {
-    return null;
-  }
-
-  const str = primitiveValue.replace(/\D/g, '');
-  if (/^\d{6}$/.test(str)) {
-    return str;
-  }
-
-  return null;
-}
-
-function derivePeriodFromDate(date: string | null): string | null {
-  if (!date) {
-    return null;
-  }
-
-  return date.slice(0, 4) + date.slice(5, 7);
-}
-
-function normalizeTimbrado(value: unknown): string | null {
-  if (value == null) {
-    return null;
-  }
-
-  const primitiveValue = toPrimitiveString(value);
-  if (!primitiveValue) {
-    return null;
-  }
-
-  const cleaned = primitiveValue.trim().replace(/\D/g, '');
-  if (!cleaned) {
-    return null;
-  }
-
-  return cleaned;
-}
-
-function normalizeNumber(value: unknown): number | null {
-  if (value == null) {
-    return null;
-  }
-
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? Number(value.toFixed(2)) : null;
-  }
-
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    const sanitized = trimmed.replace(/[^\d,.-]/g, '');
-    let normalized = sanitized;
-
-    const hasDot = normalized.includes('.');
-    const hasComma = normalized.includes(',');
-
-    if (hasDot && hasComma) {
-      if (normalized.lastIndexOf(',') > normalized.lastIndexOf('.')) {
-        normalized = normalized.replace(/\./g, '').replace(',', '.');
-      } else {
-        normalized = normalized.replace(/,/g, '');
-      }
-    } else if (hasComma && !hasDot) {
-      normalized = normalized.replace(',', '.');
-    }
-
-    const numeric = Number(normalized);
-    if (Number.isNaN(numeric)) {
-      return null;
-    }
-
-    return Number(numeric.toFixed(2));
-  }
-
-  return null;
-}
-
-function toPrimitiveString(value: unknown): string | null {
-  if (typeof value === 'string') {
-    return value;
+    return trimmed.length > 0 ? trimmed : null;
   }
 
   if (typeof value === 'number' || typeof value === 'bigint') {

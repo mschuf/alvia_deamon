@@ -92,6 +92,8 @@ export class OcrDaemonService {
     try {
       const limit = this.resolveBatchLimit(options.limit);
       const defaultPrompt = await this.loadDefaultPrompt(runId);
+      const updatableColumns =
+        await this.daemonRepository.getDocumentUpdatableColumns();
       const pendingDocuments =
         await this.daemonRepository.fetchPendingDocuments(limit);
       summary.totalFound = pendingDocuments.length;
@@ -102,6 +104,7 @@ export class OcrDaemonService {
         metadata: {
           count: pendingDocuments.length,
           limit,
+          updatableColumnsCount: updatableColumns.size,
         },
       });
 
@@ -111,6 +114,7 @@ export class OcrDaemonService {
           runId,
           document,
           defaultPrompt,
+          updatableColumns,
         );
 
         if (result.status === 'updated') {
@@ -188,6 +192,7 @@ export class OcrDaemonService {
     runId: string,
     document: DocumentToProcess,
     defaultPrompt: PromptRow | null,
+    updatableColumns: Set<string>,
   ): Promise<ProcessResult> {
     const contextBase = {
       runId,
@@ -267,22 +272,23 @@ export class OcrDaemonService {
         },
       });
 
-      const normalizedData = normalizeOcrPayload(rawOcrData);
+      const normalizedData = normalizeOcrPayload(rawOcrData, updatableColumns);
+      const updateFields = Object.keys(normalizedData.documentUpdates);
 
-      if (!normalizedData.doc_numero || !normalizedData.doc_fecha_emision) {
+      if (updateFields.length === 0) {
         await this.safeSetDocumentStatus(
           document.id,
           'OCR_INCOMPLETO',
           contextBase,
         );
         this.stepLogger.error(
-          'OCR incompleto: faltan campos minimos (doc_numero o doc_fecha_emision).',
+          'OCR sin campos validos para actualizar lk_documentos.',
           {
             ...contextBase,
             step: 'doc.validate_output',
             metadata: {
-              doc_numero: normalizedData.doc_numero,
-              doc_fecha_emision: normalizedData.doc_fecha_emision,
+              ignoredFields: normalizedData.ignoredFields,
+              responseKeys: Object.keys(rawOcrData),
             },
           },
         );
@@ -307,8 +313,10 @@ export class OcrDaemonService {
           metadata: {
             partnerCreated: persistResult.partnerCreated,
             partnerId: persistResult.partnerId,
-            doc_numero: normalizedData.doc_numero,
-            doc_fecha_emision: normalizedData.doc_fecha_emision,
+            updatedFields: updateFields,
+            providerFiscalId: normalizedData.providerFiscalId,
+            aliasesApplied: normalizedData.aliasesApplied,
+            ignoredFields: normalizedData.ignoredFields,
           },
         },
       );
@@ -362,8 +370,9 @@ export class OcrDaemonService {
 INSTRUCCIONES OBLIGATORIAS DE SALIDA:
 - Responde exclusivamente con JSON valido.
 - No incluyas markdown, ni explicaciones, ni texto adicional.
-- Usa exactamente estos campos:
-  sn_ruc, sn_name, doc_numero, doc_fecha_emision, doc_timbrado, doc_vence_timbrado, doc_periodo, doc_cdc, doc_monto_10, doc_iva_10, doc_monto_5, doc_iva_5, doc_monto_exento, doc_monto_total.
+- Usa nombres de campos que existan en la tabla lk_documentos.
+- Si no detectas un dato, omite la clave (no inventes valores).
+- Puedes incluir sn_name para indicar el nombre del proveedor cuando se deba crear el socio de negocio.
 `;
 
     if (!defaultPrompt) {

@@ -11,21 +11,12 @@ export interface PromptRow {
   active: boolean;
 }
 
-export interface NormalizedOcrData {
-  sn_ruc: string;
-  sn_nombre: string;
-  doc_numero: string | null;
-  doc_fecha_emision: string | null;
-  doc_timbrado: string | null;
-  doc_vence_timbrado: string | null;
-  doc_periodo: string | null;
-  doc_cdc: string | null;
-  doc_monto_10: number | null;
-  doc_iva_10: number | null;
-  doc_monto_5: number | null;
-  doc_iva_5: number | null;
-  doc_monto_exento: number | null;
-  doc_monto_total: number | null;
+export interface PreparedOcrPayload {
+  documentUpdates: Record<string, unknown>;
+  providerFiscalId: string | null;
+  providerName: string | null;
+  ignoredFields: string[];
+  aliasesApplied: Record<string, string>;
 }
 
 export interface DaemonCycleSummary {

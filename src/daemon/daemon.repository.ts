@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { DataSource, EntityManager } from 'typeorm';
 import {
   DocumentToProcess,
-  NormalizedOcrData,
+  PreparedOcrPayload,
   PromptRow,
 } from './daemon.types';
 
@@ -16,9 +16,27 @@ interface IdRow {
   sn_id: unknown;
 }
 
+interface ColumnNameRow {
+  column_name: string;
+}
+
 @Injectable()
 export class DaemonRepository {
   private readonly schema: string;
+  private readonly columnsCacheMs: number;
+  private documentColumnsCache: string[] = [];
+  private documentColumnsCacheAt = 0;
+
+  private readonly protectedColumns = new Set<string>([
+    'id',
+    'emp_id',
+    'usr_id',
+    'doc_documento',
+    'doc_estado',
+    'doc_fecha_carga',
+    'fecha_creacion',
+    'fecha_modificacion',
+  ]);
 
   constructor(
     private readonly dataSource: DataSource,
@@ -30,6 +48,15 @@ export class DaemonRepository {
       throw new Error(`DB_SCHEMA inválido: ${configuredSchema}`);
     }
     this.schema = configuredSchema;
+
+    const configuredCacheMs = Number(
+      this.configService.get<string>('OCR_DOCUMENT_COLUMNS_CACHE_MS') ??
+        300000,
+    );
+    this.columnsCacheMs =
+      Number.isFinite(configuredCacheMs) && configuredCacheMs >= 0
+        ? Math.floor(configuredCacheMs)
+        : 300000;
   }
 
   async fetchPendingDocuments(limit: number): Promise<DocumentToProcess[]> {
@@ -80,54 +107,88 @@ export class DaemonRepository {
     return rows[0] ?? null;
   }
 
-  async persistProcessedDocument(
-    documentId: number,
-    ocrData: NormalizedOcrData,
-  ): Promise<PersistResult> {
-    return this.dataSource.transaction(async (manager) => {
-      const businessPartner = await this.ensureBusinessPartner(
-        manager,
-        ocrData.sn_ruc,
-        ocrData.sn_nombre,
+  async getDocumentUpdatableColumns(): Promise<Set<string>> {
+    const now = Date.now();
+    const canReuseCache =
+      this.documentColumnsCache.length > 0 &&
+      now - this.documentColumnsCacheAt <= this.columnsCacheMs;
+
+    if (canReuseCache) {
+      return new Set(this.documentColumnsCache);
+    }
+
+    const rawRows: unknown = await this.dataSource.query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name = 'lk_documentos'
+      ORDER BY ordinal_position ASC
+      `,
+      [this.schema],
+    );
+    const rows = this.asArray<ColumnNameRow>(rawRows);
+
+    const columns = rows
+      .map((row) => String(row.column_name || '').trim())
+      .filter(
+        (columnName) =>
+          columnName.length > 0 && !this.protectedColumns.has(columnName),
       );
 
-      await manager.query(
+    this.documentColumnsCache = columns;
+    this.documentColumnsCacheAt = now;
+
+    return new Set(columns);
+  }
+
+  async persistProcessedDocument(
+    documentId: number,
+    ocrData: PreparedOcrPayload,
+  ): Promise<PersistResult> {
+    return this.dataSource.transaction(async (manager) => {
+      const updateEntries = Object.entries(ocrData.documentUpdates).filter(
+        ([, value]) => value !== undefined,
+      );
+
+      if (updateEntries.length === 0) {
+        throw new Error('No hay campos OCR validos para actualizar.');
+      }
+
+      const businessPartner = await this.ensureBusinessPartner(
+        manager,
+        ocrData.providerFiscalId,
+        ocrData.providerName,
+      );
+
+      const assignments: string[] = [];
+      const values: unknown[] = [];
+
+      for (const [columnName, value] of updateEntries) {
+        values.push(value);
+        assignments.push(
+          `${this.quoteIdentifier(columnName)} = $${values.length}`,
+        );
+      }
+
+      assignments.push(`doc_estado = 'OCR_PROCESADO'`);
+      assignments.push(`fecha_modificacion = NOW()`);
+      values.push(documentId);
+
+      const updatedRawRows: unknown = await manager.query(
         `
         UPDATE ${this.schema}.lk_documentos
-        SET sn_id_fiscal = $1,
-            doc_numero = $2,
-            doc_fecha_emision = $3,
-            doc_timbrado = $4,
-            doc_vence_timbrado = $5,
-            doc_periodo = $6,
-            doc_cdc = $7,
-            doc_monto_10 = $8,
-            doc_iva_10 = $9,
-            doc_monto_5 = $10,
-            doc_iva_5 = $11,
-            doc_monto_exento = $12,
-            doc_monto_total = $13,
-            doc_estado = 'OCR_PROCESADO',
-            fecha_modificacion = NOW()
-        WHERE id = $14
+        SET ${assignments.join(', ')}
+        WHERE id = $${values.length}
+        RETURNING id
         `,
-        [
-          ocrData.sn_ruc,
-          ocrData.doc_numero,
-          ocrData.doc_fecha_emision,
-          ocrData.doc_timbrado,
-          ocrData.doc_vence_timbrado,
-          ocrData.doc_periodo,
-          ocrData.doc_cdc,
-          ocrData.doc_monto_10,
-          ocrData.doc_iva_10,
-          ocrData.doc_monto_5,
-          ocrData.doc_iva_5,
-          ocrData.doc_monto_exento,
-          ocrData.doc_monto_total,
-          documentId,
-        ],
+        values,
       );
+      const updatedRows = this.asArray<{ id: unknown }>(updatedRawRows);
+
+      if (updatedRows.length === 0) {
+        throw new Error(`No existe lk_documentos.id=${documentId}`);
+      }
 
       return businessPartner;
     });
@@ -147,10 +208,11 @@ export class DaemonRepository {
 
   private async ensureBusinessPartner(
     manager: EntityManager,
-    ruc: string,
-    providerName: string,
+    fiscalId: string | null,
+    providerName: string | null,
   ): Promise<PersistResult> {
-    if (ruc === '0000000-0') {
+    const normalizedFiscalId = (fiscalId ?? '').trim();
+    if (!normalizedFiscalId) {
       return {
         partnerCreated: false,
         partnerId: null,
@@ -164,7 +226,7 @@ export class DaemonRepository {
       WHERE sn_id_fiscal = $1
       LIMIT 1
       `,
-      [ruc],
+      [normalizedFiscalId],
     );
     const existingRows = this.asArray<IdRow>(existingRawRows);
 
@@ -198,7 +260,7 @@ export class DaemonRepository {
       )
       RETURNING sn_id
       `,
-      [providerName, ruc],
+      [this.resolveProviderName(providerName, normalizedFiscalId), normalizedFiscalId],
     );
     const insertedRows = this.asArray<IdRow>(insertedRawRows);
     const insertedPartnerId = this.toNumericId(insertedRows[0]?.sn_id);
@@ -211,6 +273,18 @@ export class DaemonRepository {
 
   private asArray<T>(value: unknown): T[] {
     return Array.isArray(value) ? (value as T[]) : [];
+  }
+
+  private resolveProviderName(
+    providerName: string | null,
+    fallbackFiscalId: string,
+  ): string {
+    const cleanedName = (providerName ?? '').trim();
+    return cleanedName.length > 0 ? cleanedName : fallbackFiscalId;
+  }
+
+  private quoteIdentifier(identifier: string): string {
+    return `"${identifier.replace(/"/g, '""')}"`;
   }
 
   private toNumericId(value: unknown): number | null {

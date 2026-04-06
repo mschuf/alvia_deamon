@@ -12,8 +12,8 @@ Responsabilidades:
   - `prompt`,
   - `documento` (`doc_documento` crudo).
 - Recibir JSON OCR desde `alvia_ocr`.
-- Normalizar datos y actualizar `public.lk_documentos`.
-- Crear socio de negocio basico si no existe por `sn_id_fiscal`.
+- Actualizar dinamicamente `public.lk_documentos` usando los nombres de campo devueltos por OCR.
+- Crear socio de negocio basico si no existe por `sn_id_fiscal` (opcionalmente usando `sn_name` del OCR).
 - Registrar cada paso en logs estructurados.
 
 ## Flujo
@@ -25,9 +25,9 @@ Responsabilidades:
    - obtiene prompt activo de la empresa.
    - compone prompt final.
    - llama `POST {ALVIA_OCR_BASE_URL}/ocr/process-daemon`.
-   - valida respuesta OCR minima.
-   - actualiza `lk_documentos`.
-   - inserta socio de negocio si el RUC no existe.
+   - filtra claves OCR validas para columnas de `lk_documentos`.
+   - actualiza `lk_documentos` de forma dinamica.
+   - inserta socio de negocio si no existe `sn_id_fiscal`.
 
 ## Endpoints del daemon
 
@@ -67,6 +67,7 @@ OCR_DAEMON_INTERVAL_MINUTES=5
 OCR_DAEMON_BATCH_SIZE=20
 OCR_DAEMON_RUN_ON_STARTUP=true
 OCR_DEFAULT_PROMPT_ID=1
+OCR_DOCUMENT_COLUMNS_CACHE_MS=300000
 
 # Manual run security (optional)
 DAEMON_CONTROL_TOKEN=
@@ -112,6 +113,13 @@ Pasos principales:
 - `OCR_INCOMPLETO`
 - `OCR_ERROR`
 
+## Contrato JSON OCR (dinamico)
+
+- El daemon toma el JSON del OCR y actualiza solo claves que existan como columnas en `lk_documentos`.
+- Si agregas un nuevo campo en `lk_documentos` y el OCR devuelve esa misma clave, el daemon lo actualiza sin cambios de codigo.
+- `sn_name` es una clave especial: no se guarda en `lk_documentos`, se usa para crear `lk_socios_negocios` cuando no existe el `sn_id_fiscal`.
+- Compatibilidad legacy: si llega `sn_ruc`, el daemon lo interpreta como `sn_id_fiscal`.
+
 ## Run
 
 ```bash
@@ -124,4 +132,3 @@ Build:
 ```bash
 npm run build
 ```
-

@@ -1,56 +1,48 @@
 # ALVIA Daemon (NestJS)
 
-Daemon OCR para ALVIA que:
+`alvia_daemon` es el orquestador de OCR.
+No ejecuta OCR ni habla con Gemini directamente.
 
-- Busca documentos pendientes en `public.v_documentos_a_procesar`.
-- Obtiene prompt activo por empresa desde `public.lk_prompts`.
-- Envía el documento a Gemini OCR.
-- Normaliza la respuesta JSON.
-- Actualiza `public.lk_documentos`.
-- Si el RUC del proveedor no existe en `public.lk_socios_negocios`, crea un registro básico.
-- Registra todo paso a paso en consola y archivo de log.
+Responsabilidades:
 
-## Flujo funcional
+- Buscar pendientes en `public.v_documentos_a_procesar`.
+- Buscar prompt activo por empresa en `public.lk_prompts`.
+- Enviar a `alvia_ocr`:
+  - `empresaId` (obligatorio),
+  - `prompt`,
+  - `documento` (`doc_documento` crudo).
+- Recibir JSON OCR desde `alvia_ocr`.
+- Normalizar datos y actualizar `public.lk_documentos`.
+- Crear socio de negocio basico si no existe por `sn_id_fiscal`.
+- Registrar cada paso en logs estructurados.
 
-1. Scheduler ejecuta el daemon cada `OCR_DAEMON_INTERVAL_MINUTES`.
-2. Se consultan documentos pendientes:
-   - `doc_numero` nulo/vacío.
-   - `doc_fecha_emision` nula.
-3. Por cada documento:
-   - Busca prompt activo por `emp_id`.
-   - Si no hay prompt: `doc_estado = OCR_NO_PROMPT` y log de error.
-   - Parsea `doc_documento` (soporta `data:...base64`, URL, path local o base64 directo).
-   - Envía OCR a Gemini.
-   - Valida y normaliza salida.
-   - Si faltan campos mínimos (`doc_numero` o `doc_fecha_emision`): `doc_estado = OCR_INCOMPLETO`.
-   - Si está completo:
-     - Upsert básico de socio de negocio por `sn_id_fiscal`.
-     - Update de `lk_documentos` con los datos OCR.
-     - `doc_estado = OCR_PROCESADO`.
+## Flujo
 
-## Endpoints
+1. Scheduler ejecuta cada `OCR_DAEMON_INTERVAL_MINUTES`.
+2. Lee pendientes desde la vista.
+3. Por documento:
+   - valida que exista `doc_documento`.
+   - obtiene prompt activo de la empresa.
+   - compone prompt final.
+   - llama `POST {ALVIA_OCR_BASE_URL}/ocr/process-daemon`.
+   - valida respuesta OCR minima.
+   - actualiza `lk_documentos`.
+   - inserta socio de negocio si el RUC no existe.
+
+## Endpoints del daemon
 
 - `GET /`
-  - Información básica del servicio.
+  - info base del servicio.
 - `GET /daemon/health`
-  - Estado actual del daemon y resumen de última corrida.
+  - estado actual + ultimo resumen.
 - `POST /daemon/run`
-  - Ejecuta una corrida manual.
-  - Body opcional:
-    ```json
-    {
-      "limit": 20
-    }
-    ```
-  - Si `DAEMON_CONTROL_TOKEN` está definido, requiere header `x-daemon-token`.
+  - corrida manual opcional con `limit`.
 
-## Swagger
+Swagger:
 
-- URL: `http://localhost:<PORT>/api`
+- `http://localhost:<PORT>/api`
 
 ## Variables de entorno
-
-Usar `.env.example` como base.
 
 ```env
 # Server
@@ -65,11 +57,10 @@ POSTGRES_DB=ALVIA_BACK
 DB_SCHEMA=public
 TYPEORM_LOGGING=false
 
-# Gemini OCR
-GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-3.1-flash
-GEMINI_API_URL=https://generativelanguage.googleapis.com/v1beta
-GEMINI_TIMEOUT_MS=60000
+# ALVIA OCR service (daemon delegates OCR here)
+ALVIA_OCR_BASE_URL=http://localhost:3000
+ALVIA_OCR_TIMEOUT_MS=120000
+ALVIA_OCR_API_TOKEN=
 
 # Daemon behavior
 OCR_DAEMON_INTERVAL_MINUTES=5
@@ -86,35 +77,42 @@ LOG_TO_FILE=true
 LOG_DIR=logs
 ```
 
-## Logs paso a paso
+## Logs
 
-Los logs se escriben en:
+Destino:
 
-- Consola.
-- Archivo diario: `logs/daemon-YYYY-MM-DD.log`.
+- consola
+- `logs/daemon-YYYY-MM-DD.log`
 
-Formato JSON por línea, con contexto:
+Campos de contexto:
 
 - `runId`
 - `documentId`
 - `companyId`
 - `step`
-- `message`
 - `metadata`
 
-Ejemplos de `step`:
+Pasos principales:
 
 - `cycle.start`
 - `cycle.fetch_pending`
 - `doc.start`
 - `doc.prompt`
-- `doc.prepare`
-- `doc.gemini_response`
+- `doc.send_ocr`
+- `doc.ocr_response`
 - `doc.persist`
 - `doc.error`
 - `cycle.finish`
 
-## Instalación y ejecución
+## Estados de documento
+
+- `OCR_PROCESADO`
+- `OCR_NO_PROMPT`
+- `OCR_SIN_ARCHIVO`
+- `OCR_INCOMPLETO`
+- `OCR_ERROR`
+
+## Run
 
 ```bash
 npm install
@@ -125,32 +123,5 @@ Build:
 
 ```bash
 npm run build
-```
-
-## Estados de documento usados por el daemon
-
-- `OCR_PROCESADO`
-- `OCR_NO_PROMPT`
-- `OCR_SIN_ARCHIVO`
-- `OCR_INCOMPLETO`
-- `OCR_ERROR`
-
-## Notas de diseño
-
-- El daemon usa `v_documentos_a_procesar` para seleccionar pendientes.
-- El campo fiscal de socio de negocio se maneja con `sn_id_fiscal`.
-- El insert en `lk_socios_negocios` es básico:
-  - `sn_nombre`
-  - `sn_id_fiscal`
-  - `sn_tipo = 'P'`
-  - `sn_activo = true`
-- Se consulta `OCR_DEFAULT_PROMPT_ID` (por defecto `1`) como referencia adicional al prompt por empresa.
-
-## Git inicial
-
-Proyecto preparado para repositorio independiente en `alvia_daemon/`:
-
-```bash
-git init
 ```
 

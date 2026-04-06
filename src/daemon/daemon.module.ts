@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { DaemonController } from './daemon.controller';
 import { DaemonRepository } from './daemon.repository';
 import { DaemonSchedulerService } from './daemon-scheduler.service';
-import { GeminiClient } from './gemini.client';
+import { AlviaOcrClient } from './alvia-ocr.client';
 import { OcrDaemonService } from './ocr-daemon.service';
 
 @Module({
@@ -10,7 +10,7 @@ import { OcrDaemonService } from './ocr-daemon.service';
   providers: [
     DaemonRepository,
     DaemonSchedulerService,
-    GeminiClient,
+    AlviaOcrClient,
     OcrDaemonService,
   ],
   exports: [OcrDaemonService],

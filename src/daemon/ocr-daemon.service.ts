@@ -1,27 +1,18 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { constants } from 'node:fs';
-import { access, readFile } from 'node:fs/promises';
-import { extname } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { StepLoggerService } from '../logging/step-logger.service';
+import { AlviaOcrClient } from './alvia-ocr.client';
 import { DaemonRepository } from './daemon.repository';
 import {
   DaemonCycleSummary,
   DocumentToProcess,
   PromptRow,
 } from './daemon.types';
-import { GeminiClient } from './gemini.client';
 import { normalizeOcrPayload } from './ocr-normalizer';
-import { StepLoggerService } from '../logging/step-logger.service';
 
 interface RunCycleOptions {
   limit?: number;
-}
-
-interface ParsedDocumentData {
-  mimeType: string;
-  base64Data: string;
-  source: 'data_uri' | 'url' | 'file_path' | 'base64_text';
 }
 
 type ProcessResultStatus = 'updated' | 'failed' | 'skipped';
@@ -39,7 +30,7 @@ export class OcrDaemonService {
   constructor(
     private readonly configService: ConfigService,
     private readonly daemonRepository: DaemonRepository,
-    private readonly geminiClient: GeminiClient,
+    private readonly alviaOcrClient: AlviaOcrClient,
     private readonly stepLogger: StepLoggerService,
   ) {}
 
@@ -60,7 +51,7 @@ export class OcrDaemonService {
   ): Promise<DaemonCycleSummary> {
     if (this.isRunning) {
       const activeRunId = this.lastSummary?.runId ?? 'run-in-progress';
-      this.stepLogger.warn('Se omite ciclo porque ya hay otro en ejecución.', {
+      this.stepLogger.warn('Se omite ciclo porque ya hay otro en ejecucion.', {
         runId: activeRunId,
         step: 'cycle.guard',
         metadata: {
@@ -167,7 +158,7 @@ export class OcrDaemonService {
 
     if (!token || token !== controlToken) {
       throw new UnauthorizedException(
-        'Token de control inválido para ejecución manual del daemon.',
+        'Token de control invalido para ejecucion manual del daemon.',
       );
     }
   }
@@ -251,30 +242,26 @@ export class OcrDaemonService {
         companyPrompt.prompt,
         defaultPrompt,
       );
-      const parsedDocument = await this.parseDocumentData(
-        document.doc_documento,
-      );
 
-      this.stepLogger.debug('Documento preparado para envío a Gemini.', {
+      this.stepLogger.debug('Enviando documento a alvia_ocr.', {
         ...contextBase,
-        step: 'doc.prepare',
+        step: 'doc.send_ocr',
         metadata: {
-          source: parsedDocument.source,
-          mimeType: parsedDocument.mimeType,
-          base64Length: parsedDocument.base64Data.length,
+          documentLength: document.doc_documento.length,
           promptId: companyPrompt.id,
         },
       });
 
-      const rawOcrData = await this.geminiClient.extractStructuredData({
+      const rawOcrData = await this.alviaOcrClient.processDocument({
+        documento: document.doc_documento,
+        empresaId: document.emp_id,
         prompt: composedPrompt,
-        mimeType: parsedDocument.mimeType,
-        base64Data: parsedDocument.base64Data,
+        documentId: document.id,
       });
 
-      this.stepLogger.debug('Respuesta OCR recibida de Gemini.', {
+      this.stepLogger.debug('Respuesta OCR recibida desde alvia_ocr.', {
         ...contextBase,
-        step: 'doc.gemini_response',
+        step: 'doc.ocr_response',
         metadata: {
           responseKeys: Object.keys(rawOcrData),
         },
@@ -289,7 +276,7 @@ export class OcrDaemonService {
           contextBase,
         );
         this.stepLogger.error(
-          'OCR incompleto: faltan campos mínimos (doc_numero o doc_fecha_emision).',
+          'OCR incompleto: faltan campos minimos (doc_numero o doc_fecha_emision).',
           {
             ...contextBase,
             step: 'doc.validate_output',
@@ -373,7 +360,7 @@ export class OcrDaemonService {
   ): string {
     const strictOutputInstructions = `
 INSTRUCCIONES OBLIGATORIAS DE SALIDA:
-- Responde exclusivamente con JSON válido.
+- Responde exclusivamente con JSON valido.
 - No incluyas markdown, ni explicaciones, ni texto adicional.
 - Usa exactamente estos campos:
   sn_ruc, sn_name, doc_numero, doc_fecha_emision, doc_timbrado, doc_vence_timbrado, doc_periodo, doc_cdc, doc_monto_10, doc_iva_10, doc_monto_5, doc_iva_5, doc_monto_exento, doc_monto_total.
@@ -384,68 +371,6 @@ INSTRUCCIONES OBLIGATORIAS DE SALIDA:
     }
 
     return `${companyPrompt}\n\n${strictOutputInstructions}\nReferencia adicional:\n${defaultPrompt.prompt}`;
-  }
-
-  private async parseDocumentData(
-    documentValue: string,
-  ): Promise<ParsedDocumentData> {
-    const trimmed = documentValue.trim();
-
-    const dataUriMatch = trimmed.match(/^data:([^;]+);base64,(.+)$/s);
-    if (dataUriMatch) {
-      const [, mimeType, data] = dataUriMatch;
-      return {
-        mimeType,
-        base64Data: sanitizeBase64(data),
-        source: 'data_uri',
-      };
-    }
-
-    if (/^https?:\/\//i.test(trimmed)) {
-      const response = await fetch(trimmed);
-      if (!response.ok) {
-        throw new Error(
-          `No se pudo descargar documento URL (${response.status}).`,
-        );
-      }
-
-      const mimeType =
-        response.headers.get('content-type') ?? 'application/pdf';
-      const buffer = Buffer.from(await response.arrayBuffer());
-      return {
-        mimeType: mimeType.split(';')[0],
-        base64Data: buffer.toString('base64'),
-        source: 'url',
-      };
-    }
-
-    if (await this.pathExists(trimmed)) {
-      const buffer = await readFile(trimmed);
-      return {
-        mimeType: guessMimeTypeFromPath(trimmed),
-        base64Data: buffer.toString('base64'),
-        source: 'file_path',
-      };
-    }
-
-    if (looksLikeBase64(trimmed)) {
-      return {
-        mimeType: 'application/pdf',
-        base64Data: sanitizeBase64(trimmed),
-        source: 'base64_text',
-      };
-    }
-
-    throw new Error('Formato de doc_documento no soportado.');
-  }
-
-  private async pathExists(pathValue: string): Promise<boolean> {
-    try {
-      await access(pathValue, constants.F_OK);
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   private resolveBatchLimit(limitOverride: number | undefined): number {
@@ -467,7 +392,7 @@ INSTRUCCIONES OBLIGATORIAS DE SALIDA:
     const prompt = await this.daemonRepository.findPromptById(promptId);
     if (!prompt) {
       this.stepLogger.warn(
-        'No se encontró el prompt base por ID configurado.',
+        'No se encontro el prompt base por ID configurado.',
         {
           runId,
           step: 'cycle.default_prompt',
@@ -497,31 +422,4 @@ INSTRUCCIONES OBLIGATORIAS DE SALIDA:
       partnersCreated: 0,
     };
   }
-}
-
-function looksLikeBase64(value: string): boolean {
-  if (value.length < 32) {
-    return false;
-  }
-
-  return /^[A-Za-z0-9+/=\s]+$/.test(value);
-}
-
-function sanitizeBase64(value: string): string {
-  return value.replace(/\s/g, '');
-}
-
-function guessMimeTypeFromPath(pathValue: string): string {
-  const extension = extname(pathValue).toLowerCase();
-  if (extension === '.pdf') {
-    return 'application/pdf';
-  }
-  if (extension === '.png') {
-    return 'image/png';
-  }
-  if (extension === '.jpg' || extension === '.jpeg') {
-    return 'image/jpeg';
-  }
-
-  return 'application/octet-stream';
 }

@@ -124,8 +124,21 @@ Pasos principales:
 
 ```bash
 npm install
+npm run start
+```
+
+Para desarrollo con recarga:
+
+```bash
 npm run start:dev
 ```
+
+`npm run start` ahora compila y ejecuta `node dist/main`, que es mas estable para dejar el daemon corriendo por periodos largos que usar el wrapper de `nest start`.
+
+Nota para Windows:
+
+- Si el proceso queda "pausado" hasta que presionas `Enter`, normalmente no es el scheduler sino la consola entrando en modo seleccion/QuickEdit.
+- Para operacion 24/7 conviene correr el daemon desacoplado de la terminal, por ejemplo con un servicio de Windows, PM2 o NSSM.
 
 Build:
 

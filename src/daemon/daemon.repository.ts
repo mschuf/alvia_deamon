@@ -33,6 +33,7 @@ export class DaemonRepository {
     'usr_id',
     'doc_documento',
     'doc_estado',
+    'doc_motivo_rechazo',
     'doc_fecha_carga',
     'fecha_creacion',
     'fecha_modificacion',
@@ -171,7 +172,9 @@ export class DaemonRepository {
         );
       }
 
-      assignments.push(`doc_estado = 'OCR_PROCESADO'`);
+      assignments.push(
+        `doc_estado = CASE WHEN UPPER(BTRIM(COALESCE(doc_estado, ''))) = 'RECHAZADO' THEN doc_estado ELSE 'OCR_PROCESADO' END`,
+      );
       assignments.push(`fecha_modificacion = NOW()`);
       values.push(documentId);
 
@@ -198,7 +201,7 @@ export class DaemonRepository {
     await this.dataSource.query(
       `
       UPDATE ${this.schema}.lk_documentos
-      SET doc_estado = $1,
+      SET doc_estado = CASE WHEN UPPER(BTRIM(COALESCE(doc_estado, ''))) = 'RECHAZADO' THEN doc_estado ELSE $1 END,
           fecha_modificacion = NOW()
       WHERE id = $2
       `,
